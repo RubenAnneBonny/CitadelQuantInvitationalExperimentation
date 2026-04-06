@@ -4,9 +4,12 @@ import matplotlib as plt
 from sklearn.model_selection import train_test_split
 
 class Data_manager:
-    def __init__(self,filename,testsize):
+    def __init__(self,dataf=None,filename="",testsize=0.2):
         self.filename=filename
-        self.df=pd.read_csv(self.filename)
+        if(filename==""):
+            self.df=dataf
+        else:
+            self.df=pd.read_csv(self.filename)
 
         self.X_train, self.X_test = train_test_split(
             self.df, test_size=testsize, random_state=42
