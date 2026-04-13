@@ -1,23 +1,24 @@
 """
-Combined Strategy: Bollinger Band Mean Reversion + Kalman Pairs Trading
-------------------------------------------------------------------------
-Two independent signal sources are blended per tick:
+Regime-Driven Trading Strategy
+--------------------------------
+Architecture
+  1. HMM regime detector (primary driver)
+       mean_reverting → Bollinger bands + Kalman pairs both active
+       trending       → Kalman pairs only (direction-neutral spread)
+       crisis         → flatten and halt
 
-  1. Bollinger Bands (per-ticker):
-       BUY  when price < lower band  (oversold)
-       SELL when price > upper band  (overbought)
-       CLOSE when price returns inside bands
+  2. Kalman filter (rolling beta pairs trading, CRZY vs TAME)
+       Open pair when |z-score| > PAIRS_ENTRY_Z
+       Close pair when |z-score| < PAIRS_EXIT_Z
 
-  2. Kalman Pairs (CRZY vs TAME):
-       Models  CRZY_t = alpha_t + beta_t * TAME_t + e_t
-       beta_t  is estimated online — it drifts via a random-walk state model.
-       The innovation e_t (spread) is normalised to a z-score.
-       SELL CRZY / BUY  TAME when z-score >  PAIRS_ENTRY_Z  (spread too wide)
-       BUY  CRZY / SELL TAME when z-score < -PAIRS_ENTRY_Z  (spread too narrow)
-       Exit when |z-score| < PAIRS_EXIT_Z
+  3. Bollinger bands (per-ticker mean reversion)
+       Only active in mean_reverting regime
 
-Signal priority: pairs signal takes precedence when active; Bollinger runs
-on whichever tickers are NOT currently committed to a pairs trade.
+Transaction cost controls
+  - State machine per ticker/pair: only trade on genuine signal transitions
+  - TRADE_COOLDOWN: minimum ticks between successive orders on same ticker
+  - All orders are LIMIT at mid price — never market orders
+  - cancel_all() only when a signal reverses, not every tick
 
 Compatible with Rotman Interactive Trader (RIT) REST API v1.
 """
@@ -26,29 +27,34 @@ import time
 import requests
 import numpy as np
 from kalman_pairs import KalmanPairFilter
+from hmm_regime import OnlineHMMRegime
 
 # ── API config ────────────────────────────────────────────────────────────────
 API_KEY = "IRJW2AFJ"
 BASE    = "http://localhost:9999/v1"
 HEADERS = {"X-API-Key": API_KEY}
 
-# ── General parameters ────────────────────────────────────────────────────────
+# ── General ───────────────────────────────────────────────────────────────────
 TICKERS           = ["CRZY", "TAME"]
-PAIR              = ("CRZY", "TAME")   # y, x  (CRZY = alpha + beta*TAME + e)
+PAIR              = ("CRZY", "TAME")   # y = CRZY, x = TAME
 MAX_POSITION      = 10_000
 TRADE_SIZE        = 500
 STOP_TRADING_TICK = 290
 MIN_HISTORY       = 3
 POLL_INTERVAL     = 0.25
+TRADE_COOLDOWN    = 5    # minimum ticks between orders on the same ticker
 
-# ── Bollinger Band parameters ─────────────────────────────────────────────────
-BB_WINDOW     = 20
-BB_WIDTH      = 1.5
+# ── Bollinger bands ───────────────────────────────────────────────────────────
+BB_WINDOW = 20
+BB_WIDTH  = 1.5
 
-# ── Kalman pairs parameters ───────────────────────────────────────────────────
-KF_DELTA      = 1e-3    # how fast beta is allowed to drift
-PAIRS_ENTRY_Z = 2.0     # z-score to open a pairs trade
-PAIRS_EXIT_Z  = 0.5     # z-score to close a pairs trade
+# ── Kalman pairs ──────────────────────────────────────────────────────────────
+KF_DELTA      = 1e-3
+PAIRS_ENTRY_Z = 2.0
+PAIRS_EXIT_Z  = 0.5
+
+# ── HMM ──────────────────────────────────────────────────────────────────────
+HMM_K = 3    # number of regimes: mean_reverting / trending / crisis
 
 
 # ── API helpers ───────────────────────────────────────────────────────────────
@@ -64,13 +70,14 @@ def get_book(ticker):
         f"{BASE}/securities/book", params={"ticker": ticker}, headers=HEADERS
     ).json()
 
-def place_order(ticker, action, qty, price, order_type="LIMIT"):
+def place_limit(ticker, action, qty, price):
+    """Place a limit order at the given price."""
     return requests.post(f"{BASE}/orders", headers=HEADERS, params={
         "ticker":   ticker,
-        "type":     order_type,
+        "type":     "LIMIT",
         "quantity": qty,
         "action":   action,
-        "price":    price,
+        "price":    round(price, 2),
     }).json()
 
 def cancel_all():
@@ -83,125 +90,165 @@ def get_positions():
     return {s["ticker"]: s["position"] for s in get_securities()
             if s["ticker"] in TICKERS}
 
-def get_best_bid_ask(ticker):
+def get_mid(ticker):
+    """Return mid price, or None if book is empty."""
     book = get_book(ticker)
     bid  = book["bids"][0]["price"] if book["bids"] else None
     ask  = book["asks"][0]["price"] if book["asks"] else None
-    return bid, ask
+    if bid is None or ask is None:
+        return None, None, None
+    return (bid + ask) / 2, bid, ask
 
-def flatten_position(ticker):
-    positions = get_positions()
-    pos = positions.get(ticker, 0)
+def flatten_ticker(ticker):
+    pos = get_positions().get(ticker, 0)
     if pos == 0:
         return
     qty    = min(abs(int(pos)), 25_000)
     action = "SELL" if pos > 0 else "BUY"
-    bid, ask = get_best_bid_ask(ticker)
+    mid, bid, ask = get_mid(ticker)
     price  = bid if action == "SELL" else ask
     if price is None:
         return
-    print(f"[FLATTEN] {action} {qty} {ticker} @ {price:.2f}")
-    place_order(ticker, action, qty, price, order_type="MARKET")
+    print(f"  [FLATTEN] {action} {qty} {ticker} @ {price:.2f}")
+    place_limit(ticker, action, qty, price)
 
 
-# ── Bollinger Band signal ─────────────────────────────────────────────────────
+# ── Bollinger signal (returns desired state, not action) ──────────────────────
 
-def bb_signal(price_history: list) -> str:
+def bb_desired_state(price_history: list) -> str:
+    """Returns 'long', 'short', or 'flat' based on Bollinger bands."""
     arr  = np.array(price_history[-BB_WINDOW:])
     mean = arr.mean()
     std  = arr.std()
     if std == 0:
-        return "HOLD"
-    current = price_history[-1]
-    if current < mean - BB_WIDTH * std:
-        return "BUY"
-    elif current > mean + BB_WIDTH * std:
-        return "SELL"
-    return "CLOSE"
+        return "flat"
+    p = price_history[-1]
+    if p < mean - BB_WIDTH * std:
+        return "long"
+    elif p > mean + BB_WIDTH * std:
+        return "short"
+    return "flat"
 
 
-def execute_bb(ticker, signal, price_histories, positions):
-    pos      = positions.get(ticker, 0)
-    bid, ask = get_best_bid_ask(ticker)
-    price    = price_histories[ticker][-1]
+# ── State machine helpers ─────────────────────────────────────────────────────
 
-    arr  = np.array(price_histories[ticker][-BB_WINDOW:])
-    mean, std = arr.mean(), arr.std()
-    upper = mean + BB_WIDTH * std
-    lower = mean - BB_WIDTH * std
-    print(f"  [BB] {ticker}: {price:.2f}  [{lower:.2f}|{mean:.2f}|{upper:.2f}]  → {signal}")
+def transition(ticker, from_state, to_state, positions, tick, last_traded, price_histories):
+    """
+    Moves ticker from from_state → to_state using limit orders at mid.
+    Only fires if TRADE_COOLDOWN has passed. Returns True if an order was sent.
+    """
+    if tick - last_traded.get(ticker, -999) < TRADE_COOLDOWN:
+        return False
 
-    if signal == "BUY" and pos < MAX_POSITION and ask is not None:
+    pos = positions.get(ticker, 0)
+    mid, bid, ask = get_mid(ticker)
+    if mid is None:
+        return False
+
+    orders_sent = False
+
+    # Close existing position first if changing sides
+    if from_state == "long" and to_state != "long" and pos > 0:
+        qty = min(abs(int(pos)), TRADE_SIZE)
+        print(f"  [CLOSE LONG]  {ticker} SELL {qty} @ {mid:.2f}")
+        place_limit(ticker, "SELL", qty, mid)
+        orders_sent = True
+
+    elif from_state == "short" and to_state != "short" and pos < 0:
+        qty = min(abs(int(pos)), TRADE_SIZE)
+        print(f"  [CLOSE SHORT] {ticker} BUY  {qty} @ {mid:.2f}")
+        place_limit(ticker, "BUY", qty, mid)
+        orders_sent = True
+
+    # Open new position
+    if to_state == "long" and pos < MAX_POSITION:
         qty = min(TRADE_SIZE, MAX_POSITION - int(pos))
-        place_order(ticker, "BUY", qty, ask)
+        print(f"  [OPEN  LONG]  {ticker} BUY  {qty} @ {mid:.2f}")
+        place_limit(ticker, "BUY", qty, mid)
+        orders_sent = True
 
-    elif signal == "SELL" and pos > -MAX_POSITION and bid is not None:
+    elif to_state == "short" and pos > -MAX_POSITION:
         qty = min(TRADE_SIZE, MAX_POSITION + int(pos))
-        place_order(ticker, "SELL", qty, bid)
+        print(f"  [OPEN  SHORT] {ticker} SELL {qty} @ {mid:.2f}")
+        place_limit(ticker, "SELL", qty, mid)
+        orders_sent = True
 
-    elif signal == "CLOSE":
-        if pos > 0 and bid is not None:
-            place_order(ticker, "SELL", min(int(pos), TRADE_SIZE), bid)
-        elif pos < 0 and ask is not None:
-            place_order(ticker, "BUY", min(abs(int(pos)), TRADE_SIZE), ask)
+    if orders_sent:
+        last_traded[ticker] = tick
+    return orders_sent
 
 
-# ── Kalman pairs signal ───────────────────────────────────────────────────────
+# ── Pairs execution ───────────────────────────────────────────────────────────
 
-def execute_pairs(zscore: float, beta: float, positions: dict):
+def pairs_desired_state(zscore: float, current_pair_state: str) -> str:
     """
-    Spread = CRZY - alpha - beta*TAME.
-    z > 0  → spread is too wide → SELL CRZY, BUY TAME (weighted by beta)
-    z < 0  → spread is too narrow → BUY CRZY, SELL TAME
+    Returns desired pair state: 'long_spread', 'short_spread', or 'flat'.
+    Uses hysteresis to avoid churn near the thresholds.
     """
+    if current_pair_state == "flat":
+        if zscore > PAIRS_ENTRY_Z:
+            return "short_spread"   # spread too wide: sell y, buy x
+        elif zscore < -PAIRS_ENTRY_Z:
+            return "long_spread"    # spread too narrow: buy y, sell x
+        return "flat"
+    elif current_pair_state == "short_spread":
+        return "flat" if zscore < PAIRS_EXIT_Z else "short_spread"
+    elif current_pair_state == "long_spread":
+        return "flat" if zscore > -PAIRS_EXIT_Z else "long_spread"
+    return "flat"
+
+
+def execute_pair_transition(from_state, to_state, beta, positions, tick, last_traded):
+    if from_state == to_state:
+        return
+
     ticker_y, ticker_x = PAIR
+    mid_y, bid_y, ask_y = get_mid(ticker_y)
+    mid_x, bid_x, ask_x = get_mid(ticker_x)
+    if mid_y is None or mid_x is None:
+        return
+
     pos_y = positions.get(ticker_y, 0)
     pos_x = positions.get(ticker_x, 0)
 
-    bid_y, ask_y = get_best_bid_ask(ticker_y)
-    bid_x, ask_x = get_best_bid_ask(ticker_x)
-
-    # Hedge qty for x leg scaled by beta (round to nearest lot)
     qty_y = TRADE_SIZE
     qty_x = max(1, round(abs(beta) * TRADE_SIZE))
 
-    if abs(zscore) < PAIRS_EXIT_Z:
-        # Close pairs positions if we have any
-        if pos_y != 0 and bid_y and ask_y:
-            action = "SELL" if pos_y > 0 else "BUY"
-            price  = bid_y if action == "SELL" else ask_y
-            print(f"  [PAIRS EXIT] {action} {min(abs(int(pos_y)), TRADE_SIZE)} {ticker_y}")
-            place_order(ticker_y, action, min(abs(int(pos_y)), TRADE_SIZE), price)
-        if pos_x != 0 and bid_x and ask_x:
-            action = "SELL" if pos_x > 0 else "BUY"
-            price  = bid_x if action == "SELL" else ask_x
-            print(f"  [PAIRS EXIT] {action} {min(abs(int(pos_x)), TRADE_SIZE)} {ticker_x}")
-            place_order(ticker_x, action, min(abs(int(pos_x)), TRADE_SIZE), price)
+    # Cooldown check: use the y-leg ticker as the gating key
+    if tick - last_traded.get("PAIR", -999) < TRADE_COOLDOWN:
+        return
 
-    elif zscore > PAIRS_ENTRY_Z:
+    cancel_all()
+
+    if to_state == "flat":
+        # Close both legs
+        if pos_y > 0:
+            place_limit(ticker_y, "SELL", min(abs(int(pos_y)), qty_y), mid_y)
+        elif pos_y < 0:
+            place_limit(ticker_y, "BUY",  min(abs(int(pos_y)), qty_y), mid_y)
+        if pos_x > 0:
+            place_limit(ticker_x, "SELL", min(abs(int(pos_x)), qty_x), mid_x)
+        elif pos_x < 0:
+            place_limit(ticker_x, "BUY",  min(abs(int(pos_x)), qty_x), mid_x)
+        print(f"  [PAIRS CLOSE] flat  y={mid_y:.2f} x={mid_x:.2f}")
+
+    elif to_state == "short_spread":
         # Spread too wide: SELL y, BUY x
-        if pos_y > -MAX_POSITION and bid_y:
-            qty = min(qty_y, MAX_POSITION + int(pos_y))
-            print(f"  [PAIRS] SELL {qty} {ticker_y} @ {bid_y:.2f}  z={zscore:.2f}  β={beta:.3f}")
-            place_order(ticker_y, "SELL", qty, bid_y)
-        if pos_x < MAX_POSITION and ask_x:
-            qty = min(qty_x, MAX_POSITION - int(pos_x))
-            print(f"  [PAIRS] BUY  {qty} {ticker_x} @ {ask_x:.2f}")
-            place_order(ticker_x, "BUY", qty, ask_x)
+        if pos_y > -MAX_POSITION:
+            place_limit(ticker_y, "SELL", min(qty_y, MAX_POSITION + int(pos_y)), mid_y)
+        if pos_x < MAX_POSITION:
+            place_limit(ticker_x, "BUY",  min(qty_x, MAX_POSITION - int(pos_x)), mid_x)
+        print(f"  [PAIRS OPEN]  short_spread  SELL {ticker_y} @ {mid_y:.2f}  BUY {ticker_x} @ {mid_x:.2f}  β={beta:.3f}")
 
-    elif zscore < -PAIRS_ENTRY_Z:
+    elif to_state == "long_spread":
         # Spread too narrow: BUY y, SELL x
-        if pos_y < MAX_POSITION and ask_y:
-            qty = min(qty_y, MAX_POSITION - int(pos_y))
-            print(f"  [PAIRS] BUY  {qty} {ticker_y} @ {ask_y:.2f}  z={zscore:.2f}  β={beta:.3f}")
-            place_order(ticker_y, "BUY", qty, ask_y)
-        if pos_x > -MAX_POSITION and bid_x:
-            qty = min(qty_x, MAX_POSITION + int(pos_x))
-            print(f"  [PAIRS] SELL {qty} {ticker_x} @ {bid_x:.2f}")
-            place_order(ticker_x, "SELL", qty, bid_x)
+        if pos_y < MAX_POSITION:
+            place_limit(ticker_y, "BUY",  min(qty_y, MAX_POSITION - int(pos_y)), mid_y)
+        if pos_x > -MAX_POSITION:
+            place_limit(ticker_x, "SELL", min(qty_x, MAX_POSITION + int(pos_x)), mid_x)
+        print(f"  [PAIRS OPEN]  long_spread   BUY  {ticker_y} @ {mid_y:.2f}  SELL {ticker_x} @ {mid_x:.2f}  β={beta:.3f}")
 
-    else:
-        print(f"  [PAIRS] HOLD  z={zscore:.2f}  β={beta:.3f}")
+    last_traded["PAIR"] = tick
 
 
 # ── Main loop ─────────────────────────────────────────────────────────────────
@@ -209,6 +256,12 @@ def execute_pairs(zscore: float, beta: float, positions: dict):
 def run():
     price_histories = {t: [] for t in TICKERS}
     kf              = KalmanPairFilter(delta=KF_DELTA)
+    hmm             = OnlineHMMRegime(K=HMM_K)
+
+    # Position state machines — only trade on transitions
+    bb_state        = {t: "flat" for t in TICKERS}   # flat / long / short
+    pair_state      = "flat"                           # flat / long_spread / short_spread
+    last_traded     = {}                               # ticker/key → last tick traded
     last_tick       = -1
 
     print("Waiting for case to become ACTIVE...")
@@ -229,16 +282,16 @@ def run():
             continue
         last_tick = tick
 
-        # ── End-of-case flatten ──────────────────────────────────────────────
+        # ── End-of-case flatten ───────────────────────────────────────────────
         if tick >= STOP_TRADING_TICK:
             print(f"\n[Tick {tick}] Flattening all positions...")
             cancel_all()
             for ticker in TICKERS:
-                flatten_position(ticker)
+                flatten_ticker(ticker)
             print("Done.")
             break
 
-        # ── Snapshot ─────────────────────────────────────────────────────────
+        # ── Snapshot ──────────────────────────────────────────────────────────
         securities = get_securities()
         prices = {s["ticker"]: s["last"] for s in securities if s["ticker"] in TICKERS}
         for ticker in TICKERS:
@@ -246,14 +299,12 @@ def run():
                 price_histories[ticker].append(prices[ticker])
 
         min_history = min(len(price_histories[t]) for t in TICKERS)
-        print(f"\n[Tick {tick}/{case['ticks_per_period']}]", end="  ")
-
         if min_history < MIN_HISTORY:
-            print(f"Collecting ({min_history}/{MIN_HISTORY})")
+            print(f"[Tick {tick}] Collecting ({min_history}/{MIN_HISTORY})")
             time.sleep(POLL_INTERVAL)
             continue
 
-        # ── Kalman filter update ─────────────────────────────────────────────
+        # ── Kalman update ─────────────────────────────────────────────────────
         ticker_y, ticker_x = PAIR
         kf_state = kf.update(
             y=price_histories[ticker_y][-1],
@@ -261,26 +312,62 @@ def run():
         )
         zscore = kf_state["zscore"]
         beta   = kf_state["beta"]
-        print(f"spread={kf_state['spread']:+.3f}  z={zscore:+.2f}  β={beta:.3f}")
 
-        # ── Execute signals ──────────────────────────────────────────────────
-        cancel_all()
+        # ── HMM regime update ─────────────────────────────────────────────────
+        regime = hmm.update(price_y=price_histories[ticker_y][-1], zscore=zscore)
+        if regime is None:
+            regime = "mean_reverting"   # default while warming up
+
+        print(f"\n[Tick {tick}/{case['ticks_per_period']}]  "
+              f"regime={regime}  z={zscore:+.2f}  β={beta:.3f}")
+
+        # ── Crisis: flatten and skip ──────────────────────────────────────────
+        if regime == "crisis":
+            print("  [CRISIS] Flattening and halting this tick.")
+            cancel_all()
+            for ticker in TICKERS:
+                flatten_ticker(ticker)
+            bb_state  = {t: "flat" for t in TICKERS}
+            pair_state = "flat"
+            time.sleep(POLL_INTERVAL)
+            continue
+
         positions = get_positions()
 
-        # Pairs signal (both legs)
-        execute_pairs(zscore, beta, positions)
+        # ── Pairs signal ──────────────────────────────────────────────────────
+        desired_pair = pairs_desired_state(zscore, pair_state)
+        if desired_pair != pair_state:
+            execute_pair_transition(pair_state, desired_pair, beta, positions, tick, last_traded)
+            pair_state = desired_pair
 
-        # Bollinger on each ticker independently
-        for ticker in TICKERS:
-            signal = bb_signal(price_histories[ticker])
-            execute_bb(ticker, signal, price_histories, positions)
+        # ── Bollinger signals (only in mean_reverting regime) ─────────────────
+        if regime == "mean_reverting":
+            for ticker in TICKERS:
+                desired = bb_desired_state(price_histories[ticker])
+                current = bb_state[ticker]
+                if desired != current:
+                    # Signal changed — cancel stale orders and re-evaluate
+                    cancel_all()
+                    did_trade = transition(
+                        ticker, current, desired, positions, tick, last_traded, price_histories
+                    )
+                    if did_trade:
+                        bb_state[ticker] = desired
+        else:
+            # Trending regime: close any open BB positions to avoid fighting the trend
+            for ticker in TICKERS:
+                if bb_state[ticker] != "flat":
+                    cancel_all()
+                    transition(ticker, bb_state[ticker], "flat",
+                               positions, tick, last_traded, price_histories)
+                    bb_state[ticker] = "flat"
 
         time.sleep(POLL_INTERVAL)
 
     print("\n=== TRADING COMPLETE ===")
-    positions = get_positions()
+    final = get_positions()
     for ticker in TICKERS:
-        print(f"Final position {ticker}: {positions.get(ticker, 0)}")
+        print(f"Final position {ticker}: {final.get(ticker, 0)}")
 
 
 if __name__ == "__main__":
