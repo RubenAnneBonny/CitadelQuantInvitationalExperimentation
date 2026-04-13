@@ -27,33 +27,65 @@ from sklearn.cluster import KMeans
 
 # ── HMM (ported from Training_before_comp/HMM.ipynb) ────────────────────────
 
+def _safe_cov(X_k, D, fallback_cov):
+    """Covariance of cluster X_k; falls back to fallback_cov when too few points."""
+    if len(X_k) < 2:
+        return fallback_cov.copy()
+    c = np.cov(X_k.T)
+    if c.ndim == 0:          # single feature edge case
+        c = np.array([[float(c)]])
+    c = np.where(np.isfinite(c), c, 0.0)
+    return c + np.eye(D) * 1e-4
+
+
 class HMM:
     def __init__(self, K, X):
         kmeans = KMeans(n_clusters=K, n_init=10).fit(X)
         labels = kmeans.labels_
+        D = X.shape[1]
 
         self.X = X
         self.K = K
-        self.mu    = np.array([X[labels == k].mean(axis=0) for k in range(K)])
-        self.Sigma = np.array([np.cov(X[labels == k].T) + np.eye(X.shape[1]) * 1e-6
-                               for k in range(K)])
-        self.pi    = np.array([(labels == k).mean() for k in range(K)])
-        self.A     = np.full((K, K), 1 / K)
+
+        fallback = np.cov(X.T) + np.eye(D) * 1e-4   # whole-dataset cov as fallback
+
+        self.mu = np.array([
+            X[labels == k].mean(axis=0) if (labels == k).any() else X.mean(axis=0)
+            for k in range(K)
+        ])
+        self.Sigma = np.array([
+            _safe_cov(X[labels == k], D, fallback) for k in range(K)
+        ])
+        counts = np.array([(labels == k).sum() for k in range(K)], dtype=float)
+        self.pi = np.maximum(counts / counts.sum(), 1e-6)
+        self.pi /= self.pi.sum()
+        self.A  = np.full((K, K), 1 / K)
 
     def _emission(self, x, k):
-        return multivariate_normal.pdf(x, mean=self.mu[k], cov=self.Sigma[k])
+        try:
+            v = multivariate_normal.pdf(x, mean=self.mu[k], cov=self.Sigma[k])
+            return v if np.isfinite(v) and v > 0 else 1e-300
+        except Exception:
+            return 1e-300
 
     def _forward(self):
         T     = len(self.X)
         alpha = np.zeros((T, self.K))
         for k in range(self.K):
             alpha[0, k] = self.pi[k] * self._emission(self.X[0], k)
+        # Normalise each row to prevent underflow over long sequences
+        row = alpha[0].sum()
+        if row > 0:
+            alpha[0] /= row
         for t in range(1, T):
             for k in range(self.K):
                 alpha[t, k] = (
                     self._emission(self.X[t], k)
                     * np.sum(alpha[t - 1] * self.A[:, k])
                 )
+            row = alpha[t].sum()
+            if row > 0:
+                alpha[t] /= row
         return alpha
 
     def _backward(self):
@@ -86,16 +118,28 @@ class HMM:
         return gamma, xi
 
     def _m_step(self, gamma, xi):
-        self.pi = gamma[0]
-        self.A  = xi.sum(axis=0) / gamma[:-1].sum(axis=0, keepdims=True).T
+        D = self.X.shape[1]
+        self.pi = np.maximum(gamma[0], 1e-6)
+        self.pi /= self.pi.sum()
+
+        denom_A = gamma[:-1].sum(axis=0, keepdims=True).T
+        self.A  = xi.sum(axis=0) / np.maximum(denom_A, 1e-300)
+        # Ensure rows sum to 1 and no NaNs
+        row_sums = self.A.sum(axis=1, keepdims=True)
+        self.A   = np.where(row_sums > 0, self.A / row_sums, 1 / self.K)
+
+        fallback = np.cov(self.X.T) + np.eye(D) * 1e-4
         for k in range(self.K):
-            w          = gamma[:, k]
-            self.mu[k] = (w[:, None] * self.X).sum(axis=0) / w.sum()
+            w     = gamma[:, k]
+            w_sum = w.sum()
+            if w_sum < 1e-6:   # collapsed cluster — reset to global stats
+                self.mu[k]    = self.X.mean(axis=0)
+                self.Sigma[k] = fallback.copy()
+                continue
+            self.mu[k] = (w[:, None] * self.X).sum(axis=0) / w_sum
             diff       = self.X - self.mu[k]
-            self.Sigma[k] = (
-                (w[:, None] * diff).T @ diff / w.sum()
-                + np.eye(self.X.shape[1]) * 1e-6
-            )
+            S          = (w[:, None] * diff).T @ diff / w_sum + np.eye(D) * 1e-4
+            self.Sigma[k] = np.where(np.isfinite(S), S, fallback)
 
     def _fit(self, tol=1e-4, max_iter=80):
         ll_prev = -np.inf
@@ -114,112 +158,107 @@ class HMM:
         T     = len(X_new)
         alpha = np.zeros((T, self.K))
         for k in range(self.K):
-            alpha[0, k] = self.pi[k] * multivariate_normal.pdf(
-                X_new[0], mean=self.mu[k], cov=self.Sigma[k])
+            v = multivariate_normal.pdf(X_new[0], mean=self.mu[k], cov=self.Sigma[k])
+            alpha[0, k] = self.pi[k] * (v if np.isfinite(v) else 1e-300)
+        row = alpha[0].sum()
+        if row > 0:
+            alpha[0] /= row
         for t in range(1, T):
             for k in range(self.K):
-                alpha[t, k] = (
-                    multivariate_normal.pdf(X_new[t], mean=self.mu[k], cov=self.Sigma[k])
-                    * np.sum(alpha[t - 1] * self.A[:, k])
-                )
+                v = multivariate_normal.pdf(X_new[t], mean=self.mu[k], cov=self.Sigma[k])
+                alpha[t, k] = (v if np.isfinite(v) else 1e-300) * np.sum(alpha[t - 1] * self.A[:, k])
+            row = alpha[t].sum()
+            if row > 0:
+                alpha[t] /= row
         gamma = alpha / (alpha.sum(axis=1, keepdims=True) + 1e-300)
         return gamma
 
 
 # ── Online wrapper ────────────────────────────────────────────────────────────
 
+MOM_WINDOW   = 10    # ticks for rolling momentum
 VOL_WINDOW   = 10    # ticks for rolling volatility
 MIN_SAMPLES  = 30    # minimum observations before first HMM fit
-REFIT_EVERY  = 25    # re-fit HMM every N new ticks after initial fit
+REFIT_EVERY  = 30    # re-fit HMM every N new ticks after initial fit
 
 
 class OnlineHMMRegime:
     """
-    Feed one tick at a time via .update(); get back the current regime label.
-    Returns None until MIN_SAMPLES ticks have been collected.
+    Two-regime HMM (trending / mean_reverting) fitted on (momentum, volatility).
+
+    Features are deliberately kept to 2D and K=2 so there is always a clear
+    binary split even with limited tick data. K=3 consistently collapsed to
+    one dominant regime on 30-100 tick samples.
+
+    Regimes are labelled after each fit by comparing the mean momentum of the
+    two states — the state with higher |mean momentum| is 'trending'.
     """
 
-    REGIMES = ("mean_reverting", "trending", "crisis")
-
-    def __init__(self, K: int = 3):
-        self.K            = K
-        self.hmm          = None
-        self.label_map    = {}        # HMM state index → regime string
-        self._features    = []        # list of 3-d feature vectors
-        self._returns     = []        # raw returns for volatility window
+    def __init__(self):
+        self.hmm              = None
+        self.label_map        = {}
+        self._prices          = []   # raw prices for return / momentum computation
+        self._features        = []   # (momentum, volatility) vectors
         self._ticks_since_fit = 0
-        self.current_regime   = None
+        self.current_regime   = "mean_reverting"   # safe default while warming up
 
-    def update(self, price_y: float, zscore: float) -> str | None:
+    def update(self, price: float) -> str:
         """
-        Parameters
-        ----------
-        price_y : latest price of the y-leg (CRZY)
-        zscore  : Kalman pair z-score at this tick
-
-        Returns
-        -------
-        Regime string or None if not enough data yet.
+        Ingest one new price tick. Returns the current regime label immediately
+        (defaults to 'mean_reverting' during warmup).
         """
-        # Build return
-        if self._returns:
-            ret = (price_y - self._returns[-1]) / (self._returns[-1] + 1e-9)
-        else:
-            ret = 0.0
-        self._returns.append(price_y)
+        self._prices.append(price)
+        n_prices = len(self._prices)
 
-        # Volatility of recent returns
-        ret_series = np.diff(self._returns[-VOL_WINDOW - 1:]) if len(self._returns) > 1 else [0.0]
-        vol = float(np.std(ret_series)) if len(ret_series) > 1 else 0.0
+        if n_prices < 2:
+            return self.current_regime
 
-        self._features.append(np.array([ret, vol, zscore]))
+        # Rolling momentum: mean of last MOM_WINDOW single-tick returns
+        recent = self._prices[-MOM_WINDOW - 1:]
+        rets   = np.diff(recent) / (np.array(recent[:-1]) + 1e-9)
+        mom    = float(rets.mean())
+
+        # Rolling volatility: std of those same returns
+        vol    = float(rets.std()) if len(rets) > 1 else 0.0
+
+        self._features.append(np.array([mom, vol]))
         self._ticks_since_fit += 1
 
         n = len(self._features)
         if n < MIN_SAMPLES:
-            return None
+            return self.current_regime
 
         # Fit / refit
         if self.hmm is None or self._ticks_since_fit >= REFIT_EVERY:
             self._refit()
             self._ticks_since_fit = 0
 
-        # Predict current regime using forward-only pass
-        X   = np.array(self._features)
+        # Classify current tick
+        X     = np.array(self._features)
         gamma = self.hmm.predict_states(X)
         state = int(gamma[-1].argmax())
         self.current_regime = self.label_map.get(state, "mean_reverting")
         return self.current_regime
 
     def _refit(self):
-        X = np.array(self._features)
-        self.hmm = HMM(K=self.K, X=X)
+        X        = np.array(self._features)
+        self.hmm = HMM(K=2, X=X)
+        # Bias A toward persistence — regimes should last multiple ticks
+        self.hmm.A = np.array([[0.90, 0.10],
+                                [0.10, 0.90]])
         self.hmm._fit()
         self._build_label_map()
 
     def _build_label_map(self):
         """
-        Label each HMM state by its statistical character.
-        Highest total variance → crisis
-        Highest |mean return| among the rest → trending
-        Remaining → mean_reverting
+        State with higher |mean momentum| (feature 0) → 'trending'.
+        Other state → 'mean_reverting'.
         """
-        variances    = [np.trace(self.hmm.Sigma[k]) for k in range(self.K)]
-        mean_returns = [abs(self.hmm.mu[k][0]) for k in range(self.K)]
-
-        if self.K == 2:
-            hi_var = int(np.argmax(variances))
-            self.label_map = {
-                hi_var:     "trending",
-                1 - hi_var: "mean_reverting",
-            }
-        else:  # K == 3
-            crisis_k  = int(np.argmax(variances))
-            remaining = [k for k in range(self.K) if k != crisis_k]
-            trending_k = remaining[int(np.argmax([mean_returns[k] for k in remaining]))]
-            mr_k       = [k for k in remaining if k != trending_k][0]
-            self.label_map = {
-                crisis_k:   "crisis",
-                trending_k: "trending",
-                mr_k:       "mean_reverting",
-            }
+        mom0 = abs(self.hmm.mu[0][0])
+        mom1 = abs(self.hmm.mu[1][0])
+        if mom0 >= mom1:
+            self.label_map = {0: "trending", 1: "mean_reverting"}
+        else:
+            self.label_map = {0: "mean_reverting", 1: "trending"}
+        print(f"  [HMM refit]  state0: mom={self.hmm.mu[0][0]:+.5f} vol={self.hmm.mu[0][1]:.5f} → {self.label_map[0]}"
+              f"  |  state1: mom={self.hmm.mu[1][0]:+.5f} vol={self.hmm.mu[1][1]:.5f} → {self.label_map[1]}")
