@@ -58,6 +58,7 @@ class Executor:
             self._act(ticker, signal, snapshot, tick)
 
     def _act(self, ticker: str, signal: float, snapshot: MarketSnapshot, tick: int) -> None:
+        signal = -signal  # Contrarian: always do the opposite of what the model suggests
         # Cooldown check
         if tick - self._last_traded.get(ticker, -999) < config.TRADE_COOLDOWN:
             return
